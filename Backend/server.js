@@ -14,6 +14,7 @@ const jwtSecret = process.env.JWT_SECRET
 const cookieName = 'muse_session'
 const jwtIssuer = 'muse-api'
 const jwtAudience = 'muse-web'
+const isProduction = process.env.NODE_ENV === 'production'
 const allowedOrigins = new Set(
   (process.env.WEB_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
     .split(',')
@@ -117,8 +118,8 @@ function setSessionCookie(response, userId, rememberMe) {
 
   response.cookie(cookieName, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
     maxAge: rememberMe ? durationMs : undefined,
     path: '/',
   })
@@ -129,8 +130,8 @@ async function authenticate(request, response, next) {
   if (!payload) {
     response.clearCookie(cookieName, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
       path: '/',
     })
     return response.status(401).json({ error: 'Your session has expired. Please sign in again.' })
@@ -143,8 +144,8 @@ async function authenticate(request, response, next) {
   if (!result.rows[0]) {
     response.clearCookie(cookieName, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
       path: '/',
     })
     return response.status(401).json({ error: 'Your account is no longer available.' })
@@ -264,8 +265,8 @@ app.get('/api/auth/me', authenticate, (request, response) => {
 app.post('/api/auth/logout', (_request, response) => {
   response.clearCookie(cookieName, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
     path: '/',
   })
   response.status(204).end()

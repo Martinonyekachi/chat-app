@@ -11,9 +11,17 @@ const iconPaths = {
 }
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '')
+const TOKEN_STORAGE_KEY = 'muse_access_token'
 
 function apiUrl(path) {
   return `${API_BASE_URL}/${path.replace(/^\/+/, '')}`
+}
+
+function apiFetch(path, options = {}) {
+  const headers = new Headers(options.headers)
+  const token = window.sessionStorage.getItem(TOKEN_STORAGE_KEY)
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  return fetch(apiUrl(path), { ...options, headers, credentials: 'include' })
 }
 
 async function readApiResponse(response) {
@@ -237,8 +245,9 @@ function App() {
 
     async function restoreSession() {
       try {
-        const response = await fetch(apiUrl('auth/me'), { signal: controller.signal })
+        const response = await apiFetch('auth/me', { signal: controller.signal })
         if (response.status === 401) {
+          window.sessionStorage.removeItem(TOKEN_STORAGE_KEY)
           setAuthStatus('signedOut')
           return
         }
@@ -264,8 +273,8 @@ function App() {
     async function loadChats() {
       try {
         const [conversationResponse, userResponse] = await Promise.all([
-          fetch(apiUrl('conversations'), { signal: controller.signal }),
-          fetch(apiUrl('users'), { signal: controller.signal }),
+          apiFetch('conversations', { signal: controller.signal }),
+          apiFetch('users', { signal: controller.signal }),
         ])
         const [conversationResult, userResult] = await Promise.all([
           readApiResponse(conversationResponse),
@@ -289,7 +298,13 @@ function App() {
 
   useEffect(() => {
     if (!user) return undefined
-    const socket = io({ withCredentials: true })
+    const socketOrigin = new URL(API_BASE_URL, window.location.origin).origin
+    const socket = io(socketOrigin, {
+      withCredentials: true,
+      auth: {
+        token: window.sessionStorage.getItem(TOKEN_STORAGE_KEY),
+      },
+    })
     socketRef.current = socket
 
     function joinActiveConversation() {
@@ -335,8 +350,14 @@ function App() {
       )))
     })
     socket.on('connect_error', (socketError) => {
-      if (socketError.message === 'Authentication required.') {
+      if (socketError.message === 'Session expired or invalid.') {
+        window.sessionStorage.removeItem(TOKEN_STORAGE_KEY)
         setAuthMessage('Your session expired. Please sign in again.')
+        setUser(null)
+        setAuthStatus('signedOut')
+      } else if (socketError.message === 'Authentication required.') {
+        window.sessionStorage.removeItem(TOKEN_STORAGE_KEY)
+        setAuthMessage('Please sign in again to restore your secure connection.')
         setUser(null)
         setAuthStatus('signedOut')
       } else {
@@ -363,8 +384,8 @@ function App() {
 
     async function loadMessages() {
       try {
-        const response = await fetch(
-          apiUrl(`conversations/${encodeURIComponent(activeId)}/messages`),
+        const response = await apiFetch(
+          `conversations/${encodeURIComponent(activeId)}/messages`,
           { signal: controller.signal },
         )
         const result = await readApiResponse(response)
@@ -391,7 +412,7 @@ function App() {
   async function authenticate(credentials, isRegistering) {
     let response
     try {
-      response = await fetch(apiUrl(`auth/${isRegistering ? 'register' : 'login'}`), {
+      response = await apiFetch(`auth/${isRegistering ? 'register' : 'login'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(credentials),
@@ -401,6 +422,10 @@ function App() {
     }
 
     const result = await readApiResponse(response)
+    if (typeof result.accessToken !== 'string' || !result.accessToken) {
+      throw new Error('The server did not return an authentication token.')
+    }
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, result.accessToken)
     setAuthMessage('')
     setError('')
     setUser(result.user)
@@ -409,9 +434,10 @@ function App() {
 
   async function logout() {
     try {
-      const response = await fetch(apiUrl('auth/logout'), { method: 'POST' })
+      const response = await apiFetch('auth/logout', { method: 'POST' })
       if (!response.ok) throw new Error('Unable to sign out. Please try again.')
       socketRef.current?.disconnect()
+      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY)
       setUser(null)
       setAuthStatus('signedOut')
       setConversations([])
@@ -428,7 +454,7 @@ function App() {
     setIsContactPickerOpen(true)
     setContactError('')
     try {
-      const response = await fetch(apiUrl('users'))
+      const response = await apiFetch('users')
       const result = await readApiResponse(response)
       setContacts(result.users)
     } catch (requestError) {
@@ -439,7 +465,7 @@ function App() {
   async function openConversation(participantId) {
     setError('')
     try {
-      const response = await fetch(apiUrl('conversations'), {
+      const response = await apiFetch('conversations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ participantId }),
@@ -450,8 +476,8 @@ function App() {
       setMobileChatOpen(true)
 
       const [conversationResponse, userResponse] = await Promise.all([
-        fetch(apiUrl('conversations')),
-        fetch(apiUrl('users')),
+        apiFetch('conversations'),
+        apiFetch('users'),
       ])
       const [conversationResult, userResult] = await Promise.all([
         readApiResponse(conversationResponse),
