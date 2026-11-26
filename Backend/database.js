@@ -5,8 +5,13 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL must be set.')
 }
 
+const databaseUrl = new URL(process.env.DATABASE_URL)
+if (process.env.NODE_ENV === 'production') {
+  databaseUrl.searchParams.set('sslmode', 'verify-full')
+}
+
 export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl.toString(),
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
@@ -60,6 +65,18 @@ export async function initializeDatabase() {
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique
       ON users (LOWER(username))
+    `)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        token_id UUID PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx
+      ON auth_sessions (expires_at)
     `)
     await client.query(`
       CREATE TABLE IF NOT EXISTS conversations (

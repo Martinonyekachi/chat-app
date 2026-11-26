@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import bcrypt from 'bcryptjs'
 import cookieParser from 'cookie-parser'
@@ -31,6 +32,8 @@ if (!jwtSecret || jwtSecret.length < 32) {
 
 const app = express()
 const httpServer = createServer(app)
+app.set('trust proxy', 1)
+
 const io = new SocketServer(httpServer, {
   cors: {
     origin: (origin, callback) => {
@@ -87,6 +90,15 @@ function readTokenFromCookieHeader(header = '') {
   return cookie ? cookie.slice(cookieName.length + 1) : null
 }
 
+function getRequestToken(request) {
+  const authorization = request.get('authorization')
+  if (authorization) {
+    const bearer = /^Bearer\s+([^\s]+)$/i.exec(authorization)
+    return bearer?.[1] || null
+  }
+  return request.cookies[cookieName] || null
+}
+
 function verifyToken(token) {
   if (!token) return null
 
@@ -107,27 +119,80 @@ function verifyToken(token) {
   }
 }
 
-function setSessionCookie(response, userId, rememberMe) {
+function createSessionToken(userId, rememberMe) {
   const durationMs = rememberMe ? 7 * 24 * 60 * 60 * 1000 : 8 * 60 * 60 * 1000
+  const tokenId = randomUUID()
   const token = jwt.sign({ sub: String(userId) }, jwtSecret, {
     algorithm: 'HS256',
     expiresIn: Math.floor(durationMs / 1000),
     issuer: jwtIssuer,
     audience: jwtAudience,
+    jwtid: tokenId,
   })
 
-  response.cookie(cookieName, token, {
+  return {
+    token,
+    tokenId,
+    expiresAt: new Date(Date.now() + durationMs),
+    durationMs,
+  }
+}
+
+async function saveSession(connection, userId, session) {
+  await connection.query(
+    'INSERT INTO auth_sessions (token_id, user_id, expires_at) VALUES ($1, $2, $3)',
+    [session.tokenId, userId, session.expiresAt],
+  )
+}
+
+function setSessionCookie(response, session, rememberMe) {
+  response.set('Cache-Control', 'no-store')
+  response.cookie(cookieName, session.token, {
     httpOnly: true,
     secure: isProduction,
     sameSite: isProduction ? 'none' : 'lax',
-    maxAge: rememberMe ? durationMs : undefined,
+    maxAge: rememberMe ? session.durationMs : undefined,
     path: '/',
   })
+  return session.token
+}
+
+async function hasActiveSession(payload) {
+  if (!payload || typeof payload.jti !== 'string') return false
+
+  const result = await pool.query(
+    `SELECT 1 FROM auth_sessions
+     WHERE token_id = $1 AND user_id = $2 AND expires_at > NOW()`,
+    [payload.jti, payload.sub],
+  )
+  return result.rowCount > 0
+}
+
+async function revokeSession(payload) {
+  if (!(await hasActiveSession(payload))) return
+
+  await pool.query('DELETE FROM auth_sessions WHERE token_id = $1', [payload.jti])
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.data.tokenId === payload.jti) socket.disconnect(true)
+  }
 }
 
 async function authenticate(request, response, next) {
-  const payload = verifyToken(request.cookies[cookieName])
-  if (!payload) {
+  let token = getRequestToken(request)
+  let payload = verifyToken(token)
+  let isActive = await hasActiveSession(payload)
+
+  if (!isActive && request.get('authorization')) {
+    const cookieToken = request.cookies[cookieName]
+    const cookiePayload = verifyToken(cookieToken)
+    if (await hasActiveSession(cookiePayload)) {
+      token = cookieToken
+      payload = cookiePayload
+      isActive = true
+    }
+  }
+
+  if (!isActive) {
     response.clearCookie(cookieName, {
       httpOnly: true,
       secure: isProduction,
@@ -208,17 +273,24 @@ app.post('/api/auth/register', authRateLimit, async (request, response) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 12)
+  const client = await pool.connect()
   try {
-    const result = await pool.query(
+    await client.query('BEGIN')
+    const result = await client.query(
       `INSERT INTO users (username, email, password_hash)
        VALUES ($1, $2, $3)
        RETURNING id::text, username, email`,
       [username, email, passwordHash],
     )
     const user = result.rows[0]
-    setSessionCookie(response, user.id, body.rememberMe === true)
-    return response.status(201).json({ user })
+    const rememberMe = body.rememberMe === true
+    const session = createSessionToken(user.id, rememberMe)
+    await saveSession(client, user.id, session)
+    await client.query('COMMIT')
+    const accessToken = setSessionCookie(response, session, rememberMe)
+    return response.status(201).json({ user, accessToken })
   } catch (error) {
+    await client.query('ROLLBACK')
     if (error.code === '23505' && error.constraint === 'users_email_lower_unique') {
       return response.status(409).json({ error: 'An account with that email already exists.' })
     }
@@ -226,6 +298,8 @@ app.post('/api/auth/register', authRateLimit, async (request, response) => {
       return response.status(409).json({ error: 'That username is already taken.' })
     }
     throw error
+  } finally {
+    client.release()
   }
 })
 
@@ -252,9 +326,13 @@ app.post('/api/auth/login', authRateLimit, async (request, response) => {
     return response.status(401).json({ error: 'Invalid email or password.' })
   }
 
-  setSessionCookie(response, user.id, request.body.rememberMe === true)
+  const rememberMe = request.body.rememberMe === true
+  const session = createSessionToken(user.id, rememberMe)
+  await saveSession(pool, user.id, session)
+  const accessToken = setSessionCookie(response, session, rememberMe)
   return response.json({
     user: { id: user.id, username: user.username, email: user.email },
+    accessToken,
   })
 })
 
@@ -262,7 +340,15 @@ app.get('/api/auth/me', authenticate, (request, response) => {
   response.json({ user: request.user })
 })
 
-app.post('/api/auth/logout', (_request, response) => {
+app.post('/api/auth/logout', async (request, response) => {
+  let token = getRequestToken(request)
+  let payload = verifyToken(token)
+  if (!(await hasActiveSession(payload)) && request.get('authorization')) {
+    token = request.cookies[cookieName]
+    payload = verifyToken(token)
+  }
+  await revokeSession(payload)
+
   response.clearCookie(cookieName, {
     httpOnly: true,
     secure: isProduction,
@@ -408,9 +494,26 @@ app.use((error, _request, response, next) => {
 
 io.use(async (socket, next) => {
   try {
-    const token = readTokenFromCookieHeader(socket.handshake.headers.cookie)
-    const payload = verifyToken(token)
-    if (!payload) return next(new Error('Authentication required.'))
+    const authToken = socket.handshake.auth?.token
+    let token = typeof authToken === 'string' && authToken
+      ? authToken
+      : readTokenFromCookieHeader(socket.handshake.headers.cookie)
+    let payload = verifyToken(token)
+    let isActive = await hasActiveSession(payload)
+
+    if (!isActive && typeof authToken === 'string' && authToken) {
+      const cookieToken = readTokenFromCookieHeader(socket.handshake.headers.cookie)
+      const cookiePayload = verifyToken(cookieToken)
+      if (await hasActiveSession(cookiePayload)) {
+        token = cookieToken
+        payload = cookiePayload
+        isActive = true
+      }
+    }
+
+    if (!isActive) {
+      return next(new Error(token ? 'Session expired or invalid.' : 'Authentication required.'))
+    }
 
     const result = await pool.query(
       'SELECT id::text, username FROM users WHERE id = $1',
@@ -419,6 +522,7 @@ io.use(async (socket, next) => {
     if (!result.rows[0]) return next(new Error('Account not found.'))
 
     socket.data.user = result.rows[0]
+    socket.data.tokenId = payload.jti
     socket.data.tokenExpiresAt = payload.exp * 1000
     return next()
   } catch (error) {
